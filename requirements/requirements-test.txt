@@ -10,7 +10,7 @@ torchrec==0.2.0
 contexttimer
 einops
 triton
-requests==2.27.1 # downgrade to avoid huggingface error https://github.com/huggingface/transformers/issues/17611
+requests==2.33.0 # downgrade to avoid huggingface error https://github.com/huggingface/transformers/issues/17611
 SentencePiece
 ninja
 flash_attn
