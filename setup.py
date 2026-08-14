@@ -111,7 +111,6 @@ setup(
             "tests",
             "scripts",
             "requirements",
-            "extensions",
             "*.egg-info",
         ),
     ),
@@ -145,6 +144,7 @@ setup(
     package_data={
         "colossalai": [
             "kernel/extensions/csrc/**/*",
+            "kernel/extensions/pybind/**/*",
         ]
     },
 )

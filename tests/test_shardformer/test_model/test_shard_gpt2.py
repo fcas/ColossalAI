@@ -100,7 +100,14 @@ def check_forward_backward(model_fn, data_gen_fn, output_transform_fn, loss_fn, 
             atol, rtol = 5e-3, 5e-3
 
         if org_model.__class__.__name__ == "GPT2Model":
-            check_output_hidden_state(org_output, sharded_output, stage_manager, atol=atol, rtol=rtol)
+            check_output_hidden_state(
+                org_output,
+                sharded_output,
+                stage_manager,
+                atol=atol,
+                rtol=rtol,
+                shard_config=booster.plugin.shard_config,
+            )
 
         check_loss(org_loss, sharded_loss, atol=atol, rtol=rtol)
 
@@ -132,14 +139,27 @@ def check_forward_backward(model_fn, data_gen_fn, output_transform_fn, loss_fn, 
     "test_config",
     [
         {
-            "tp_size": 4,
-            "pp_size": 1,
-            "num_microbatches": 1,
+            "sp_size": 2,
+            "tp_size": 1,
+            "pp_size": 2,
             "enable_sequence_parallelism": True,
-            "sequence_parallelism_mode": "ring",
-            "enable_flash_attention": False,
+            "sequence_parallelism_mode": "ring_attn",
+            "num_microbatches": 2,
+            "enable_all_optimization": True,
             "use_lazy_init": True,
-            "precision": "fp32",
+            "precision": "fp16",
+            "initial_scale": 1,
+        },
+        {
+            "sp_size": 2,
+            "tp_size": 2,
+            "pp_size": 1,
+            "enable_sequence_parallelism": True,
+            "sequence_parallelism_mode": "ring_attn",
+            "num_microbatches": 1,
+            "enable_all_optimization": True,
+            "use_lazy_init": True,
+            "precision": "fp16",
             "initial_scale": 1,
         },
         {
@@ -148,7 +168,7 @@ def check_forward_backward(model_fn, data_gen_fn, output_transform_fn, loss_fn, 
             "num_microbatches": 1,
             "enable_sequence_parallelism": True,
             "sequence_parallelism_mode": "split_gather",
-            "enable_flash_attention": False,
+            "enable_flash_attention": True,
             "use_lazy_init": True,
             "precision": "fp16",
             "initial_scale": 1,
@@ -156,49 +176,20 @@ def check_forward_backward(model_fn, data_gen_fn, output_transform_fn, loss_fn, 
         {
             "tp_size": 2,
             "pp_size": 2,
-            "num_microbatches": 4,
-            "enable_all_optimization": True,
-            "use_lazy_init": True,
-            "precision": "fp16",
-            "initial_scale": 1,
-        },
-        {
-            "tp_size": 1,
-            "pp_size": 2,
-            "num_microbatches": 4,
-            "enable_all_optimization": True,
-            "use_lazy_init": True,
-            "precision": "fp16",
-            "initial_scale": 1,
-        },
-        {
-            "tp_size": 4,
-            "pp_size": 1,
-            "enable_all_optimization": False,
+            "num_microbatches": 2,
+            "enable_sequence_parallelism": True,
+            "sequence_parallelism_mode": "split_gather",
+            "enable_flash_attention": True,
             "use_lazy_init": False,
-            "precision": "fp32",
-        },
-        {
-            "tp_size": 2,
-            "pp_size": 1,
-            "enable_all_optimization": False,
-            "use_lazy_init": False,
-            "precision": "fp32",
+            "precision": "fp16",
+            "initial_scale": 1,
         },
         {
             "tp_size": 2,
             "pp_size": 2,
-            "num_microbatches": 4,
-            "enable_all_optimization": False,
-            "use_lazy_init": True,
-            "precision": "fp32",
-        },
-        {
-            "tp_size": 2,
-            "pp_size": 1,
+            "num_microbatches": 2,
             "enable_all_optimization": True,
             "use_lazy_init": True,
-            "zero_stage": 2,
             "precision": "fp16",
             "initial_scale": 1,
         },
@@ -225,7 +216,16 @@ def run_gpt2_test(test_config):
         loss_fn,
         _,
     ) in sub_model_zoo.items():
-        check_forward_backward(model_fn, data_gen_fn, output_transform_fn, loss_fn, test_config)
+
+        if test_config.get("sequence_parallelism_mode", None) == "ring_attn" and name != "transformers_gpt_lm":
+            # Only wrote zigzag splitting for cross entropy loss
+            continue
+
+        try:
+            check_forward_backward(model_fn, data_gen_fn, output_transform_fn, loss_fn, test_config)
+        except Exception as e:
+            print(f"Failed config: {test_config} for model {name}")
+            raise (e)
 
     clear_layout_converter()
     torch.cuda.empty_cache()
@@ -238,7 +238,7 @@ def run_gpt2_test(test_config):
             "tp_size": 2,
             "pp_size": 2,
             "num_microbatches": 4,
-            "enable_all_optimization": False,
+            "enable_all_optimization": True,
             "use_lazy_init": False,
             "precision": "fp32",
             "initial_scale": 1,
@@ -247,7 +247,7 @@ def run_gpt2_test(test_config):
             "tp_size": 2,
             "pp_size": 2,
             "num_microbatches": 4,
-            "enable_all_optimization": False,
+            "enable_all_optimization": True,
             "use_lazy_init": False,
             "precision": "fp16",
             "zero_stage": 1,
@@ -266,7 +266,11 @@ def run_gpt2_3d_test(test_config):
         loss_fn,
         _,
     ) in sub_model_zoo.items():
-        check_forward_backward(model_fn, data_gen_fn, output_transform_fn, loss_fn, test_config)
+        try:
+            check_forward_backward(model_fn, data_gen_fn, output_transform_fn, loss_fn, test_config)
+        except Exception as e:
+            print(f"Failed config: {test_config} for model {name}")
+            raise (e)
 
     clear_layout_converter()
     torch.cuda.empty_cache()

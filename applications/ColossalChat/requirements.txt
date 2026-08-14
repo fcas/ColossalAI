@@ -1,10 +1,9 @@
-transformers==4.34.1
-huggingface_hub==0.17.3
+transformers>=4.39.3
 tqdm
-datasets
+datasets==2.14.7
 loralib
-colossalai>=0.3.6
-torch>=1.12.1
+colossalai>=0.4.7
+torch>=2.1.0
 langchain
 tokenizers
 fastapi
@@ -22,3 +21,7 @@ ninja==1.11.1
 sentencepiece==0.1.99
 flash-attn
 tiktoken
+jsonlines
+math_verify
+latex2sympy2_extended
+pyext

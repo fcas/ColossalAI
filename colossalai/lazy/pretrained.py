@@ -62,7 +62,6 @@ def new_from_pretrained(
     config = kwargs.pop("config", None)
     cache_dir = kwargs.pop("cache_dir", None)
     force_download = kwargs.pop("force_download", False)
-    resume_download = kwargs.pop("resume_download", False)
     proxies = kwargs.pop("proxies", None)
     local_files_only = kwargs.pop("local_files_only", False)
     use_auth_token = kwargs.pop("use_auth_token", None)
@@ -70,7 +69,7 @@ def new_from_pretrained(
     _ = kwargs.pop("mirror", None)
     from_pipeline = kwargs.pop("_from_pipeline", None)
     from_auto_class = kwargs.pop("_from_auto", False)
-    _fast_init = kwargs.pop("_fast_init", True)
+    kwargs.pop("_fast_init", True)
     torch_dtype = kwargs.pop("torch_dtype", None)
     subfolder = kwargs.pop("subfolder", "")
     commit_hash = kwargs.pop("_commit_hash", None)
@@ -116,7 +115,6 @@ def new_from_pretrained(
             cache_dir=cache_dir,
             return_unused_kwargs=True,
             force_download=force_download,
-            resume_download=resume_download,
             proxies=proxies,
             local_files_only=local_files_only,
             use_auth_token=use_auth_token,
@@ -195,7 +193,6 @@ def new_from_pretrained(
                     "cache_dir": cache_dir,
                     "force_download": force_download,
                     "proxies": proxies,
-                    "resume_download": resume_download,
                     "local_files_only": local_files_only,
                     "use_auth_token": use_auth_token,
                     "user_agent": user_agent,
@@ -289,7 +286,7 @@ def new_from_pretrained(
     config.name_or_path = pretrained_model_name_or_path
 
     # Instantiate model.
-    init_contexts = [no_init_weights(_enable=_fast_init)]
+    init_contexts = [no_init_weights()]
 
     with ContextManagers(init_contexts):
         model = cls(config, *model_args, **model_kwargs)
@@ -312,7 +309,6 @@ def new_from_pretrained(
                 pretrained_model_name_or_path,
                 cache_dir=cache_dir,
                 force_download=force_download,
-                resume_download=resume_download,
                 proxies=proxies,
                 local_files_only=local_files_only,
                 use_auth_token=use_auth_token,

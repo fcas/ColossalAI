@@ -1,6 +1,7 @@
 """
 reward model
 """
+
 from typing import Optional
 
 import torch
@@ -24,7 +25,9 @@ class RewardModel(BaseModel):
         self.value_head = nn.Linear(self.last_hidden_state_size, 1)
         self.value_head.weight.data.normal_(mean=0.0, std=1 / (self.last_hidden_state_size + 1))
 
-    def forward(self, input_ids: torch.LongTensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self, input_ids: torch.LongTensor, attention_mask: Optional[torch.Tensor] = None, **kwargs
+    ) -> torch.Tensor:
         outputs = self.model(input_ids, attention_mask=attention_mask)
 
         last_hidden_states = outputs["last_hidden_state"]
@@ -36,3 +39,9 @@ class RewardModel(BaseModel):
         )
         values = self.value_head(sequence_hidden_states).squeeze(-1)  # Ensure shape is (B,)
         return values
+
+    def get_input_embeddings(self):
+        return self.model.get_input_embeddings()
+
+    def get_output_embeddings(self):
+        return self.model.get_output_embeddings()

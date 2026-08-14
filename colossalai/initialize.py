@@ -3,6 +3,13 @@
 
 import os
 
+# set CUDA_DEVICE_MAX_CONNECTIONS=1 to ensure that when overlapping communication and computation,
+# the order of of kernel launches on GPUs are the same as on the CPU so that comm is launched first.
+# see https://github.com/NVIDIA/Megatron-LM/issues/533
+# https://forums.developer.nvidia.com/t/how-many-streams-maximum-number-of-streams/6571/16
+os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
+
+import torch
 import torch.distributed as dist
 
 from colossalai.accelerator import get_accelerator
@@ -45,7 +52,10 @@ def launch(
     backend = cur_accelerator.communication_backend
 
     # init default process group
-    init_method = f"tcp://[{host}]:{port}"
+    if ":" in host:  # IPv6
+        init_method = f"tcp://[{host}]:{port}"
+    else:  # IPv4
+        init_method = f"tcp://{host}:{port}"
     dist.init_process_group(rank=rank, world_size=world_size, backend=backend, init_method=init_method)
 
     # set cuda device
@@ -54,6 +64,11 @@ def launch(
         cur_accelerator.set_device(local_rank)
 
     set_seed(seed)
+
+    try:
+        torch._dynamo.config.optimize_ddp = world_size > 1
+    except AttributeError:
+        pass
 
     if verbose:
         logger = get_dist_logger()

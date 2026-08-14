@@ -137,14 +137,40 @@ def check_forward_backward(model_fn, data_gen_fn, output_transform_fn, loss_fn, 
     "test_config",
     [
         {
-            "tp_size": 4,
+            "tp_size": 2,
+            "pp_size": 2,
+            "num_microbatches": 2,
+            "enable_sequence_parallelism": True,
+            "sequence_parallelism_mode": "split_gather",
+            "enable_flash_attention": True,
+            "use_lazy_init": True,
+            "zero_stage": 1,
+            "precision": "fp16",
+            "initial_scale": 1,
+        },
+        {  # Ulysess + Flash attention
+            "tp_size": 1,
+            "pp_size": 2,
+            "sp_size": 2,
+            "num_microbatches": 2,
+            "enable_sequence_parallelism": True,
+            "sequence_parallelism_mode": "all_to_all",
+            "enable_flash_attention": True,
+            "use_lazy_init": True,
+            "zero_stage": 1,
+            "precision": "fp16",
+            "initial_scale": 1,
+        },
+        {
+            "tp_size": 1,
             "pp_size": 1,
+            "sp_size": 2,
             "num_microbatches": 1,
             "enable_sequence_parallelism": True,
-            "sequence_parallelism_mode": "ring",
-            "enable_flash_attention": False,
+            "sequence_parallelism_mode": "all_to_all",
             "use_lazy_init": True,
-            "precision": "fp32",
+            "zero_stage": 1,
+            "precision": "fp16",
             "initial_scale": 1,
         },
         {
@@ -210,7 +236,11 @@ def run_chatglm_test(test_config):
         loss_fn,
         _,
     ) in sub_model_zoo.items():
-        check_forward_backward(model_fn, data_gen_fn, output_transform_fn, loss_fn, test_config)
+        try:
+            check_forward_backward(model_fn, data_gen_fn, output_transform_fn, loss_fn, test_config)
+        except Exception as e:
+            print(f"Test config failed for model {name}: {test_config}")
+            raise e
 
     clear_layout_converter()
     torch.cuda.empty_cache()

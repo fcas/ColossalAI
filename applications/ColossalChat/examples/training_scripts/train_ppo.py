@@ -12,11 +12,19 @@ from coati.dataset import (
     StatefulDistributedSampler,
     load_tokenized_dataset,
     setup_conversation_template,
-    setup_distributed_dataloader,
 )
-from coati.models import Critic, RewardModel, convert_to_lora_module, disable_dropout
+from coati.models import (
+    Critic,
+    LoraConfig,
+    RewardModel,
+    RLVRRewardModel,
+    convert_to_lora_module,
+    disable_dropout,
+    lora_manager,
+)
 from coati.trainer import PPOTrainer
 from coati.utils import load_checkpoint
+from coati.utils.reward_score import *
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import colossalai
@@ -26,13 +34,26 @@ from colossalai.cluster import DistCoordinator
 from colossalai.logging import get_dist_logger
 from colossalai.nn.lr_scheduler import CosineAnnealingWarmupLR
 from colossalai.nn.optimizer import HybridAdam
+from colossalai.shardformer.policies.auto_policy import get_autopolicy
 
 logger = get_dist_logger()
 
+# default settings for response format tags, overwrite it in chat_template definition if needed
+response_format_tags = {
+    "think_start": {"text": "<think>", "num_occur": 1},
+    "think_end": {"text": "</think>", "num_occur": 1},
+    "answer_start": {"text": "<answer>", "num_occur": 1},
+    "answer_end": {"text": "</answer>", "num_occur": 1},
+}
+
 
 def train(args):
+    global response_format_tags
+    lora_config = None
+    if args.lora_config is not None:
+        lora_config = LoraConfig.from_file(args.lora_config)
     # check lora compatibility
-    if "gemini" in args.plugin and args.lora_rank > 0:
+    if "gemini" in args.plugin and lora_config is not None and lora_config.r > 0:
         raise ValueError("LoRA is not supported in GeminiPlugin. Please use other plugin")
     if args.plugin == "gemini_auto" and args.accumulation_steps > 1:
         raise ValueError("Gradient accumulation is not supported in GeminiPlugin. Please use other plugin")
@@ -51,77 +72,60 @@ def train(args):
     # )
 
     init_ctx = nullcontext()
-    booster_policy = None
     with init_ctx:
         if args.use_flash_attn:
             actor = AutoModelForCausalLM.from_pretrained(
                 args.pretrain,
                 torch_dtype=torch.bfloat16 if args.mixed_precision == "bf16" else torch.float16,
                 use_flash_attention_2=True,
-                local_files_only=True,
+                trust_remote_code=True,
             )
             ref_model = AutoModelForCausalLM.from_pretrained(
                 args.pretrain,
                 torch_dtype=torch.bfloat16 if args.mixed_precision == "bf16" else torch.float16,
                 use_flash_attention_2=True,
-                local_files_only=True,
+                trust_remote_code=True,
             )
-            reward_model = RewardModel(
-                args.rm_pretrain,
-                torch_dtype=torch.bfloat16 if args.mixed_precision == "bf16" else torch.float16,
-                use_flash_attention_2=True,
-            )
+            if not args.no_neural_reward_model:
+                reward_model = RewardModel(
+                    args.rm_pretrain,
+                    torch_dtype=torch.bfloat16 if args.mixed_precision == "bf16" else torch.float16,
+                    use_flash_attention_2=True,
+                    trust_remote_code=True,
+                )
             critic = Critic(
                 args.rm_pretrain,
                 torch_dtype=torch.bfloat16 if args.mixed_precision == "bf16" else torch.float16,
                 use_flash_attention_2=True,
+                trust_remote_code=True,
             )
             coordinator.print_on_master(msg="Flash-attention enabled successfully")
         else:
-            actor = AutoModelForCausalLM.from_pretrained(args.pretrain, local_files_only=True)
-            ref_model = AutoModelForCausalLM.from_pretrained(args.pretrain, local_files_only=True)
-            reward_model = RewardModel(args.rm_pretrain)
+            actor = AutoModelForCausalLM.from_pretrained(args.pretrain, trust_remote_code=True)
+            ref_model = AutoModelForCausalLM.from_pretrained(args.pretrain, trust_remote_code=True)
+            if not args.no_neural_reward_model:
+                reward_model = RewardModel(args.rm_pretrain, trust_remote_code=True)
             critic = Critic(args.rm_pretrain)
+
+        if args.lora_config is not None:
+            actor = convert_to_lora_module(actor, lora_config=lora_config)
+            critic = convert_to_lora_module(critic, lora_config=lora_config)
+            for name, module in actor.named_modules():
+                if "norm" in name or "gate" in name:
+                    module = module.to(torch.float32)
+            for name, module in critic.named_modules():
+                if "norm" in name or "gate" in name:
+                    module = module.to(torch.float32)
+            lora_manager.able_to_merge = False
+
         # Disable dropout
         disable_dropout(actor)
         disable_dropout(critic)
 
-        if args.tp > 1:
-            if reward_model.model.config.architectures[0] != critic.model.config.architectures[0]:
-                raise ValueError("Reward model and critic model must have the same architecture")
-            if reward_model.model.config.architectures[0] == "BloomForCausalLM":
-                from colossalai.shardformer.policies.bloom import BloomPolicy
-
-                booster_policy = BloomPolicy()
-            elif reward_model.model.config.architectures[0] == "LlamaForCausalLM":
-                from colossalai.shardformer.policies.llama import LlamaPolicy
-
-                booster_policy = LlamaPolicy()
-            elif reward_model.model.config.architectures[0] == "GPT2LMHeadModel":
-                from colossalai.shardformer.policies.gpt2 import GPT2Policy
-
-                booster_policy = GPT2Policy()
-            elif reward_model.model.config.architectures[0] == "ChatGLMModel":
-                from colossalai.shardformer.policies.chatglm2 import ChatGLMPolicy
-
-                booster_policy = ChatGLMPolicy()
-            elif reward_model.model.config.architectures[0] == "OPTForCausalLM":
-                from colossalai.shardformer.policies.opt import OPTPolicy
-
-                booster_policy = OPTPolicy()
-            else:
-                raise ValueError("Unknown model architecture for policy")
-
-        if args.lora_rank > 0:
-            actor = convert_to_lora_module(actor, args.lora_rank, lora_train_bias=args.lora_train_bias)
-            critic = convert_to_lora_module(critic, args.lora_rank, lora_train_bias=args.lora_train_bias)
-
-    if args.grad_checkpoint and args.lora_rank == 0:
-        actor.gradient_checkpointing_enable()
-        critic.model.gradient_checkpointing_enable()
+    if args.grad_checkpoint:
+        actor.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        critic.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         coordinator.print_on_master(msg="Gradient checkpointing enabled successfully")
-    elif args.lora_rank > 0:
-        coordinator.print_on_master(msg="Gradient checkpointing will be disabled when LoRA is enabled")
 
     # configure tokenizer
     tokenizer_dir = args.tokenizer_dir if args.tokenizer_dir is not None else args.pretrain
@@ -130,6 +134,9 @@ def train(args):
         with open(args.conversation_template_config, "r", encoding="utf8") as f:
             conversation_template_config = json.load(f)
         dist.barrier()
+        if "response_format_tags" in conversation_template_config:
+            logger.warning(f"Overwrite default response format tags with {args.conversation_template_config}")
+            response_format_tags = conversation_template_config.get("response_format_tags", response_format_tags)
         conversation_template = setup_conversation_template(
             tokenizer, chat_template_config=conversation_template_config, save_path=args.conversation_template_config
         )
@@ -175,34 +182,6 @@ def train(args):
         adamw_mode=True,
     )
 
-    # configure dataset
-    coordinator.print_on_master(f"Load dataset: {args.prompt_dataset}")
-    mode_map = {"train": "train", "valid": "validation", "test": "test"}
-    train_prompt_dataset = load_tokenized_dataset(dataset_paths=args.prompt_dataset, mode="train", mode_map=mode_map)
-    data_collator = DataCollatorForPromptDataset(tokenizer=tokenizer, max_length=args.max_length - args.max_seq_len)
-    train_prompt_dataloader = setup_distributed_dataloader(
-        dataset=train_prompt_dataset,
-        batch_size=args.experience_batch_size,
-        shuffle=True,
-        drop_last=True,
-        collate_fn=data_collator,
-        use_tp=args.tp > 1,
-    )
-
-    if len(args.ptx_dataset) > 0:
-        train_ptx_dataset = load_tokenized_dataset(dataset_paths=args.ptx_dataset, mode="train", mode_map=mode_map)
-        data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer, max_length=args.max_length)
-        train_pretrain_dataloader = setup_distributed_dataloader(
-            dataset=train_ptx_dataset,
-            batch_size=args.ptx_batch_size,
-            shuffle=True,
-            drop_last=True,
-            collate_fn=data_collator,
-            use_tp=args.tp > 1,
-        )
-    else:
-        train_pretrain_dataloader = None
-
     if args.warmup_steps is None:
         args.warmup_steps = int(0.025 * args.num_episodes)
         coordinator.print_on_master(f"Warmup steps is set to {args.warmup_steps}")
@@ -237,6 +216,7 @@ def train(args):
             initial_scale=2**16,
             max_norm=args.grad_clip,
             enable_gradient_accumulation=True,
+            enable_flash_attention=args.use_flash_attn,
         )
     elif args.plugin == "gemini_auto":
         plugin = GeminiPlugin(
@@ -244,6 +224,7 @@ def train(args):
             placement_policy="auto",
             initial_scale=2**16,
             max_norm=args.grad_clip,
+            enable_flash_attention=args.use_flash_attn,
         )
     elif args.plugin == "zero2":
         plugin = LowLevelZeroPlugin(
@@ -261,20 +242,35 @@ def train(args):
             max_norm=args.grad_clip,
         )
     elif args.plugin == "3d":
+        if args.use_flash_attn and (args.tp > 1 or args.pp > 1 or args.sp > 1 or args.enable_sequence_parallelism):
+            logger.warning("Flash attention cannot be used with 3D parallelism for PPO training. Disabling it.")
+            args.use_flash_attn = False
         plugin = HybridParallelPlugin(
             tp_size=args.tp,
-            pp_size=1,
-            zero_stage=0,
+            pp_size=args.pp,
+            sp_size=args.sp,
+            sequence_parallelism_mode=args.sp_mode,
+            zero_stage=args.zero_stage,
+            enable_flash_attention=args.use_flash_attn,
+            enable_sequence_parallelism=args.enable_sequence_parallelism,
+            cpu_offload=True if args.zero_stage >= 1 and args.zero_cpu_offload else False,
             parallel_output=False,
+            max_norm=args.grad_clip,
             precision=args.mixed_precision,
         )
         custom_plugin = HybridParallelPlugin(
             tp_size=args.tp,
-            pp_size=1,
-            zero_stage=0,
+            pp_size=args.pp,
+            sp_size=args.sp,
+            sequence_parallelism_mode=args.sp_mode,
+            zero_stage=args.zero_stage,
+            enable_flash_attention=args.use_flash_attn,
+            enable_sequence_parallelism=args.enable_sequence_parallelism,
+            cpu_offload=True if args.zero_stage >= 1 and args.zero_cpu_offload else False,
             parallel_output=False,
+            max_norm=args.grad_clip,
             precision=args.mixed_precision,
-            custom_policy=booster_policy,
+            custom_policy=get_autopolicy(critic.model),
         )
     else:
         raise ValueError(f"Unknown plugin {args.plugin}")
@@ -282,9 +278,39 @@ def train(args):
     if args.plugin != "3d":
         custom_plugin = plugin
 
+    # configure dataset
+    coordinator.print_on_master(f"Load dataset: {args.prompt_dataset}")
+    mode_map = {"train": "train", "valid": "validation", "test": "test"}
+    train_prompt_dataset = load_tokenized_dataset(dataset_paths=args.prompt_dataset, mode="train", mode_map=mode_map)
+    data_collator = DataCollatorForPromptDataset(tokenizer=tokenizer, max_length=args.max_length - args.max_seq_len)
+
+    train_prompt_dataloader = plugin.prepare_dataloader(
+        dataset=train_prompt_dataset,
+        batch_size=args.experience_batch_size,
+        shuffle=True,
+        drop_last=True,
+        collate_fn=data_collator,
+        distributed_sampler_cls=StatefulDistributedSampler,
+    )
+
+    if len(args.ptx_dataset) > 0:
+        train_ptx_dataset = load_tokenized_dataset(dataset_paths=args.ptx_dataset, mode="train", mode_map=mode_map)
+        data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer, max_length=args.max_length)
+        train_pretrain_dataloader = plugin.prepare_dataloader(
+            dataset=train_ptx_dataset,
+            batch_size=args.ptx_batch_size,
+            shuffle=True,
+            drop_last=True,
+            collate_fn=data_collator,
+            distributed_sampler_cls=StatefulDistributedSampler,
+        )
+    else:
+        train_pretrain_dataloader = None
+
     actor_booster = Booster(plugin=plugin)
     ref_booster = Booster(plugin=plugin)
-    rm_booster = Booster(plugin=custom_plugin)
+    if not args.no_neural_reward_model:
+        rm_booster = Booster(plugin=custom_plugin)
     critic_booster = Booster(plugin=custom_plugin)
 
     default_dtype = torch.float16 if args.mixed_precision == "fp16" else torch.bfloat16
@@ -302,7 +328,28 @@ def train(args):
         lr_scheduler=critic_lr_scheduler,
         dataloader=train_prompt_dataloader,
     )
-    reward_model, _, _, _, _ = rm_booster.boost(model=reward_model, dataloader=train_prompt_dataloader)
+    if not args.no_neural_reward_model:
+        reward_model, _, _, _, _ = rm_booster.boost(model=reward_model, dataloader=train_prompt_dataloader)
+    else:
+        if args.reward_functions:
+            reward_fn_list = []
+            for reward_fn in args.reward_functions:
+                """
+                To define custom reward function, you can define your functions under:
+                    colossalai/applications/ColossalChat/coati/utils/reward_score/__init__.py
+                and use it here by mofiying the following line:
+                """
+                if reward_fn == "gsm8k_reward_fn":
+                    reward_fn_list.append(gsm8k_reward_fn)
+                elif reward_fn == "math_competition_reward_fn":
+                    reward_fn_list.append(math_competition_reward_fn)
+                else:
+                    raise ValueError(f"Unknown reward function {reward_fn}")
+                reward_fn_list.append(eval(reward_fn))
+            reward_model = RLVRRewardModel(
+                reward_fn_list=reward_fn_list, tokenizer=tokenizer, tags=response_format_tags
+            )
+
     ref_model, _, _, _, _ = ref_booster.boost(model=ref_model, dataloader=train_prompt_dataloader)
 
     torch.set_default_dtype(torch.float)
@@ -411,6 +458,7 @@ def train(args):
         use_cache=True,
         do_sample=True,
         temperature=0.7,
+        apply_loss_mask=not args.disable_loss_mask,
         accumulation_steps=args.accumulation_steps,
         save_dir=args.save_path,
         save_interval=args.save_interval,
@@ -430,11 +478,9 @@ def train(args):
         use_wandb=args.use_wandb,
     )
 
-    if args.lora_rank > 0 and args.merge_lora_weights:
-        from coati.models.lora import LORA_MANAGER
-
+    if lora_config is not None and lora_config.r > 0:
         # NOTE: set model to eval to merge LoRA weights
-        LORA_MANAGER.merge_weights = True
+        lora_manager.able_to_merge = True
         actor.eval()
         critic.eval()
     # save model checkpoint after fitting on only rank0
@@ -474,11 +520,19 @@ if __name__ == "__main__":
     parser.add_argument("--warmup_steps", type=int, default=None, help="Warmup steps")
     parser.add_argument("--tokenizer_dir", type=str, default=None)
     parser.add_argument("--tp", type=int, default=1)
+    parser.add_argument("--pp", type=int, default=1)
+    parser.add_argument("--sp", type=int, default=1)
+    parser.add_argument("--enable_sequence_parallelism", default=False, action="store_true")
+    parser.add_argument("--zero_stage", type=int, default=0, help="Zero stage", choices=[0, 1, 2])
+    parser.add_argument("--zero_cpu_offload", default=False, action="store_true")
+    parser.add_argument("--sp_mode", type=str, default="split_gather", choices=["split_gather", "ring", "all_to_all"])
     parser.add_argument("--pretrain", type=str, default=None)
     parser.add_argument("--rm_pretrain", type=str, default=None)
+    parser.add_argument("--no_neural_reward_model", default=False, action="store_true")
     parser.add_argument("--checkpoint_path", type=str, default=None)
     parser.add_argument("--critic_checkpoint_path", type=str, default=None)
     parser.add_argument("--rm_checkpoint_path", type=str, help="Reward model checkpoint path")
+    parser.add_argument("--reward_functions", type=str, nargs="+", default=None, help="Reward functions to use")
     parser.add_argument("--save_path", type=str, default="actor_checkpoint_prompts")
     parser.add_argument("--num_episodes", type=int, default=1)
     parser.add_argument("--num_collect_steps", type=int, default=2)
@@ -487,18 +541,17 @@ if __name__ == "__main__":
     parser.add_argument("--train_batch_size", type=int, default=16)
     parser.add_argument("--experience_batch_size", type=int, default=16)
     parser.add_argument("--ptx_batch_size", type=int, default=4)
-    parser.add_argument("--lora_train_bias", type=str, default="none")
+    parser.add_argument("--lora_config", type=str, default=None, help="low-rank adaptation config file path")
     parser.add_argument("--mixed_precision", type=str, default="fp16", choices=["fp16", "bf16"], help="Mixed precision")
     parser.add_argument("--accumulation_steps", type=int, default=8)
-    parser.add_argument("--lora_rank", type=int, default=0, help="low-rank adaptation matrices rank")
-    parser.add_argument("--merge_lora_weights", type=bool, default=True)
     parser.add_argument("--lr", type=float, default=9e-6)
     parser.add_argument("--critic_lr", type=float, default=9e-6)
     parser.add_argument("--kl_coef", type=float, default=0.1)
     parser.add_argument("--ptx_coef", type=float, default=0.0)
+    parser.add_argument("--disable_loss_mask", default=False, action="store_true")
     parser.add_argument("--max_length", type=int, default=2048)
     parser.add_argument("--max_seq_len", type=int, default=256)
-    parser.add_argument("--log_dir", default="logs", type=str)
+    parser.add_argument("--log_dir", default=None, type=str)
     parser.add_argument("--use_wandb", default=False, action="store_true")
     parser.add_argument("--grad_checkpoint", default=False, action="store_true")
     parser.add_argument("--use_flash_attn", default=False, action="store_true")

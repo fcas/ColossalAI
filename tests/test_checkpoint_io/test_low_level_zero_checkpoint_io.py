@@ -26,9 +26,11 @@ from tests.kit.model_zoo import model_zoo
 # only test 2 is fine
 @clear_cache_before_run()
 @parameterize("stage", [2])
-@parameterize("shard", [True, False])
+@parameterize("shard", [False, True])
 @parameterize("offload", [False, True])
-def check_low_level_zero_checkpointIO(stage: int, shard: bool, offload: bool):
+@parameterize("use_async", [False, True])
+@parameterize("low_cpu_mem_mode", [False, True])
+def check_low_level_zero_checkpointIO(stage: int, shard: bool, offload: bool, use_async: bool, low_cpu_mem_mode: bool):
     plugin = LowLevelZeroPlugin(stage=stage, max_norm=1.0, initial_scale=32, cpu_offload=offload)
     booster = Booster(plugin=plugin)
     model = resnet18()
@@ -41,36 +43,52 @@ def check_low_level_zero_checkpointIO(stage: int, shard: bool, offload: bool):
     loss = criterion(output)
     booster.backward(loss, optimizer)
     optimizer.step()
+
     with shared_tempdir() as tempdir:
+
         model_ckpt_path = f"{tempdir}/model"
         optimizer_ckpt_path = f"{tempdir}/optimizer"
-        # lr scheduler is tested in test_torch_ddp_checkpoint_io.py and low level zero does not change it, we can skip it here
-        booster.save_model(model, model_ckpt_path, shard=shard)
-        booster.save_optimizer(optimizer, optimizer_ckpt_path, shard=shard)
+        if not shard and not use_async:
+            model_ckpt_path = f"{model_ckpt_path}.pt"
+        if not shard and use_async:
+            model_ckpt_path = f"{model_ckpt_path}.safetensors"
+        if not shard and use_async:
+            optimizer_ckpt_path = f"{tempdir}/optimizer.safetensors"
+        booster.save_model(
+            model,
+            model_ckpt_path,
+            shard=shard,
+            use_async=use_async,
+        )
 
+        # lr scheduler is tested in test_torch_ddp_checkpoint_io.py and low level zero does not change it, we can skip it here
+        booster.save_optimizer(optimizer, optimizer_ckpt_path, shard=shard, use_async=use_async)
+        booster.checkpoint_io._sync_d2h()
+        booster.checkpoint_io._sync_io()
         dist.barrier()
 
         new_model = resnet18()
         new_optimizer = HybridAdam((new_model.parameters()), lr=0.001)
         new_model, new_optimizer, _, _, _ = booster.boost(new_model, new_optimizer)
 
-        booster.load_model(new_model, model_ckpt_path)
-        check_state_dict_equal(model.state_dict(), new_model.state_dict(), False)
+        booster.load_model(new_model, model_ckpt_path, low_cpu_mem_mode=low_cpu_mem_mode)
+        check_state_dict_equal(model.state_dict(), new_model.state_dict())
         # check master weight
         assert isinstance(new_optimizer, LowLevelZeroOptimizer)
         working_param_id_set = set(id(p) for p in new_model.parameters())
-        for p_id, master_param in new_optimizer._param_store.working_to_master_param.items():
+        for p_id, master_param in new_optimizer.working_to_master_param.items():
             assert p_id in working_param_id_set
-            working_param = new_optimizer._param_store.master_to_working_param[id(master_param)]
-            padding = new_optimizer._param_store.get_param_padding_size(working_param)
+            working_param = new_optimizer.master_to_working_param[id(master_param)]
+            padding = new_optimizer.get_param_padding_size(working_param)
             padded_param = torch.nn.functional.pad(working_param.data.view(-1), (0, padding))
             working_shard = padded_param.chunk(dist.get_world_size())[dist.get_rank()]
             assert torch.equal(
                 working_shard, master_param.data.view(-1).to(dtype=padded_param.dtype, device=padded_param.device)
             )
 
-        booster.load_optimizer(new_optimizer, optimizer_ckpt_path)
-        check_state_dict_equal(optimizer.optim.state_dict(), new_optimizer.optim.state_dict(), False)
+        booster.load_optimizer(new_optimizer, optimizer_ckpt_path, low_cpu_mem_mode=low_cpu_mem_mode)
+        check_state_dict_equal(optimizer.optim.state_dict(), new_optimizer.optim.state_dict())
+
     torch.cuda.empty_cache()
 
 
@@ -108,25 +126,25 @@ def run_fn(stage, shard, offload, model_fn, data_gen_fn, output_transform_fn, lo
 
             booster.save_lora_as_pretrained(model, model_ckpt_path)
             booster.save_optimizer(optimizer, optimizer_ckpt_path, shard=False)
+            dist.barrier()
             new_model = new_booster.enable_lora(new_model, pretrained_dir=model_ckpt_path, lora_config=lora_config)
             new_model, new_optimizer, criterion, _, _ = new_booster.boost(new_model, new_optimizer, criterion)
-            check_state_dict_equal(model.state_dict(), new_model.state_dict(), False)
+            check_state_dict_equal(model.state_dict(), new_model.state_dict())
 
             # check master weight
             assert isinstance(new_optimizer, LowLevelZeroOptimizer)
             working_param_id_set = set(id(p) for p in new_model.parameters())
-            for p_id, master_param in new_optimizer._param_store.working_to_master_param.items():
+            for p_id, master_param in new_optimizer.working_to_master_param.items():
                 assert p_id in working_param_id_set
-                working_param = new_optimizer._param_store.master_to_working_param[id(master_param)]
-                padding = new_optimizer._param_store.get_param_padding_size(working_param)
+                working_param = new_optimizer.master_to_working_param[id(master_param)]
+                padding = new_optimizer.get_param_padding_size(working_param)
                 padded_param = torch.nn.functional.pad(working_param.data.view(-1), (0, padding))
                 working_shard = padded_param.chunk(dist.get_world_size())[dist.get_rank()]
                 assert torch.equal(
                     working_shard, master_param.data.view(-1).to(dtype=padded_param.dtype, device=padded_param.device)
                 )
-
             new_booster.load_optimizer(new_optimizer, optimizer_ckpt_path)
-            check_state_dict_equal(optimizer.optim.state_dict(), new_optimizer.optim.state_dict(), False)
+            check_state_dict_equal(optimizer.optim.state_dict(), new_optimizer.optim.state_dict())
 
     except Exception as e:
         # return repr(e)
@@ -149,7 +167,7 @@ def check_low_level_zero_lora_checkpointIO(
         if name != "transformers_llama":
             continue
         task_type = None
-        if name == "transformers_llama_for_casual_lm":
+        if name == "transformers_llama_for_causal_lm":
             task_type = "CAUSAL_LM"
         if name == "transformers_llama_for_sequence_classification":
             task_type = "SEQ_CLS"

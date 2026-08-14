@@ -1,6 +1,6 @@
 import copy
 from contextlib import nullcontext
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Type
 
 import torch
 import torch.distributed as dist
@@ -10,6 +10,7 @@ from torch.distributed import ProcessGroup
 from torch.nn import Module
 from torch.optim import Adam, Optimizer
 from torch.testing import assert_close
+from transformers.modeling_outputs import BaseModelOutputWithPast
 
 from colossalai.accelerator import get_accelerator
 from colossalai.booster import Booster
@@ -17,7 +18,7 @@ from colossalai.booster.plugin import HybridParallelPlugin, LowLevelZeroPlugin
 from colossalai.booster.plugin.hybrid_parallel_plugin import HybridParallelModule
 from colossalai.checkpoint_io.utils import gather_distributed_param
 from colossalai.lazy import LazyInitContext
-from colossalai.nn.optimizer import DistGaloreAwamW
+from colossalai.nn.optimizer import GaLoreAdamW8bit
 from colossalai.nn.optimizer.galore import get_galore_param_groups
 from colossalai.pipeline.stage_manager import PipelineStageManager
 from colossalai.shardformer import ShardConfig, ShardFormer
@@ -117,7 +118,12 @@ def check_state_dict(org_model: Module, sharded_model: Module, name: str = ""):
 
 
 def build_model_from_hybrid_plugin(
-    model_fn: Callable, loss_fn: Callable, test_config: Dict[str, Any], optim_class=Adam, sharded_optim_class=Adam
+    model_fn: Callable,
+    loss_fn: Callable,
+    test_config: Dict[str, Any],
+    optim_class=Adam,
+    sharded_optim_class=Adam,
+    pluggin_cls: Type[HybridParallelPlugin] = HybridParallelPlugin,
 ):
     use_lazy_init = False
     if "use_lazy_init" in test_config:
@@ -130,7 +136,7 @@ def build_model_from_hybrid_plugin(
     if use_lazy_init:
         ctx.materialize(org_model)
     org_model = org_model.cuda()
-    if sharded_optim_class == DistGaloreAwamW:
+    if optim_class == GaLoreAdamW8bit:
         # Disable clipping and block-wise quantization
         org_optimizer = optim_class(
             get_galore_param_groups(org_model, weight_decay=0, rank=4),
@@ -149,9 +155,9 @@ def build_model_from_hybrid_plugin(
     else:
         org_optimizer = optim_class(org_model.parameters(), lr=1e-3)
         sharded_optimizer = sharded_optim_class(sharded_model.parameters(), lr=1e-3)
-    criterion = loss_fn
 
-    plugin = HybridParallelPlugin(**test_config)
+    criterion = loss_fn
+    plugin = pluggin_cls(**test_config)
     booster = Booster(plugin=plugin)
 
     sharded_model, sharded_optimizer, criterion, _, _ = booster.boost(sharded_model, sharded_optimizer, criterion)
@@ -217,7 +223,6 @@ def run_forward_backward_with_hybrid_plugin(
     for k, v in data.items():
         unshard_test_data[k] = data[k].clone()
 
-    sharded_model.train()
     if booster.plugin.stage_manager is not None:
         for k, v in shard_test_data.items():
             if torch.is_tensor(v) or "Tensor" in v.__class__.__name__:
@@ -242,7 +247,6 @@ def run_forward_backward_with_hybrid_plugin(
         sharded_loss = criterion(sharded_output)
         sharded_optimizer.backward(sharded_loss)
 
-    org_model.train()
     if booster.plugin.stage_manager is not None:
         for k, v in unshard_test_data.items():
             if torch.is_tensor(v) or "Tensor" in v.__class__.__name__:
@@ -253,7 +257,6 @@ def run_forward_backward_with_hybrid_plugin(
     org_output = org_model(**unshard_test_data)
     org_loss = criterion(org_output)
     org_loss.backward()
-
     return org_loss, org_output, sharded_loss, sharded_output
 
 
@@ -296,19 +299,35 @@ def run_forward_backward_with_low_level_zero_plugin(
 
 
 def check_output_hidden_state(
-    org_output: Tensor,
-    sharded_output: Tensor,
+    org_output: BaseModelOutputWithPast,
+    sharded_output: BaseModelOutputWithPast,
     stage_manager: Optional[PipelineStageManager] = None,
     atol: float = 1e-5,
     rtol: float = 1e-3,
+    shard_config: Optional[ShardConfig] = None,
 ):
     org_hidden_state = org_output.last_hidden_state
 
-    if stage_manager and stage_manager.is_last_stage(ignore_chunk=True):
-        sharded_hidden_state = sharded_output["outputs"]["last_hidden_state"]
+    if stage_manager:
+        if stage_manager.use_zbv:
+            if stage_manager.is_first_stage(ignore_chunk=True):
+                sharded_hidden_state = sharded_output["outputs"]["last_hidden_state"]
+            else:
+                sharded_hidden_state = sharded_output.last_hidden_state
+        elif stage_manager.is_last_stage(ignore_chunk=True):
+            sharded_hidden_state = sharded_output["outputs"]["last_hidden_state"]
+        else:
+            sharded_hidden_state = sharded_output.last_hidden_state
     else:
         sharded_hidden_state = sharded_output.last_hidden_state
 
+    # Check if the output sequence is gathered before cross entropy
+    if shard_config is not None:
+        seq_dim = 1
+        sp_group = shard_config.sequence_parallel_process_group
+        sp_size = shard_config.sequence_parallel_size
+        if org_hidden_state.shape[seq_dim] == sharded_hidden_state.shape[seq_dim] * sp_size:
+            org_hidden_state = org_hidden_state.chunk(sp_size, dim=seq_dim)[dist.get_rank(sp_group)]
     assert_close(org_hidden_state.float(), sharded_hidden_state.float(), atol=atol, rtol=rtol)
 
 
@@ -368,11 +387,13 @@ def get_grad_tensors_for_check(
             shard_grad = torch.cat(shard_grad_list, dim=dim)
 
         # embedding may be resized when using tensor parallel
-        if shard_grad.shape[0] > org_grad.shape[0]:
-            shard_grad = shard_grad[: org_grad.shape[0], :]
+        try:
+            if shard_grad.shape[0] > org_grad.shape[0]:
+                shard_grad = shard_grad[: org_grad.shape[0], :]
+        except:
+            pass
         if verbose and dist.get_rank() == 0:
             print(f"'{suffix}' grad: {org_grad}, {shard_grad}")
-
         grad_to_check[suffix] = {
             "org_grad": org_grad.float(),
             "shard_grad": shard_grad.float(),
@@ -398,9 +419,6 @@ def check_grad(
         org_grad = getattr_(org_model, suffix).weight.grad
         shard_grad = getattr_(sharded_model, suffix).weight.grad
         shard_weight = getattr_(sharded_model, suffix).weight
-        # if verbose and dist.get_rank() == 0:
-        #     print("shard_weight", shard_weight)
-        #     print("org_grad", org_grad)
         if is_distributed_tensor(shard_weight) or is_customized_distributed_tensor(shard_weight):
             shard_grad_list = [torch.zeros_like(shard_grad).to("cuda") for _ in range(dist.get_world_size(tp_group))]
             dist.all_gather(shard_grad_list, shard_grad, tp_group)
@@ -434,7 +452,7 @@ def check_all_grad_tensors(check_tensors):
     "org_grad": tensor to be compared from the original model
     "shard_grad": tensor to be compared from the sharded model
     """
-    for suffix, check_info in check_tensors.items():
+    for idx, (suffix, check_info) in enumerate(check_tensors.items()):
         org_grad = check_info["org_grad"]
         shard_grad = check_info["shard_grad"]
         rtol = check_info["rtol"]

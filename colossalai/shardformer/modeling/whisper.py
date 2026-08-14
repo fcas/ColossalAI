@@ -17,6 +17,7 @@ from transformers.modeling_outputs import (
     SequenceClassifierOutput,
 )
 from transformers.models.whisper.modeling_whisper import (
+    _HIDDEN_STATES_START_POSITION,
     WhisperDecoder,
     WhisperEncoder,
     WhisperForAudioClassification,
@@ -81,6 +82,7 @@ def get_whisper_flash_attention_forward():
         attention_mask: Optional[dict] = None,
         layer_head_mask: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
+        cache_position: Optional[torch.LongTensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         """Input shape: Batch x Time x Channel"""
         assert layer_head_mask is None, "layer_head_mask is not supported for FlashAttention"
@@ -166,10 +168,12 @@ def get_whisper_decoder_forward_for_flash_attention(shard_config: ShardConfig):
         cross_attn_head_mask=None,
         past_key_values=None,
         inputs_embeds=None,
+        position_ids=None,
         use_cache=None,
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
+        cache_position=None,
     ):
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -199,9 +203,13 @@ def get_whisper_decoder_forward_for_flash_attention(shard_config: ShardConfig):
 
         # embed positions
         if input_ids is not None:
-            positions = self.embed_positions(input_ids, past_key_values_length=past_key_values_length)
+            positions = self.embed_positions(
+                input_ids, past_key_values_length=past_key_values_length, position_ids=position_ids
+            )
         else:
-            positions = self.embed_positions(inputs_embeds, past_key_values_length=past_key_values_length)
+            positions = self.embed_positions(
+                inputs_embeds, past_key_values_length=past_key_values_length, position_ids=position_ids
+            )
 
         hidden_states = inputs_embeds + positions
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
@@ -599,6 +607,7 @@ class WhisperPipelineForwards:
         cross_attn_head_mask=None,
         past_key_values=None,
         inputs_embeds=None,
+        position_ids=None,
         use_cache=None,
         output_attentions=None,
         output_hidden_states=None,
@@ -716,9 +725,13 @@ class WhisperPipelineForwards:
 
             # embed positions
             if input_ids is not None:
-                positions = self.embed_positions(input_ids, past_key_values_length=past_key_values_length)
+                positions = self.embed_positions(
+                    input_ids, past_key_values_length=past_key_values_length, position_ids=position_ids
+                )
             else:
-                positions = self.embed_positions(inputs_embeds, past_key_values_length=past_key_values_length)
+                positions = self.embed_positions(
+                    inputs_embeds, past_key_values_length=past_key_values_length, position_ids=position_ids
+                )
 
             hidden_states = inputs_embeds + positions
             hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
@@ -841,6 +854,7 @@ class WhisperPipelineForwards:
         encoder_outputs: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
         past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
         decoder_inputs_embeds: Optional[Tuple[torch.FloatTensor]] = None,
+        decoder_position_ids: Optional[Tuple[torch.LongTensor]] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
@@ -944,6 +958,7 @@ class WhisperPipelineForwards:
             cross_attn_head_mask=cross_attn_head_mask,
             past_key_values=past_key_values,
             inputs_embeds=decoder_inputs_embeds,
+            position_ids=decoder_position_ids,
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
@@ -986,6 +1001,7 @@ class WhisperPipelineForwards:
         encoder_outputs: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
         past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
         decoder_inputs_embeds: Optional[Tuple[torch.FloatTensor]] = None,
+        decoder_position_ids: Optional[Tuple[torch.LongTensor]] = None,
         labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
@@ -1048,6 +1064,7 @@ class WhisperPipelineForwards:
             cross_attn_head_mask=cross_attn_head_mask,
             past_key_values=past_key_values,
             decoder_inputs_embeds=decoder_inputs_embeds,
+            decoder_position_ids=decoder_position_ids,
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
@@ -1118,6 +1135,12 @@ class WhisperPipelineForwards:
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
+
+        if self.config.use_weighted_layer_sum:
+            output_hidden_states = True
+        elif output_hidden_states is None:
+            output_hidden_states = self.config.output_hidden_states
+
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         # audio_classification only holds encoder
@@ -1138,7 +1161,8 @@ class WhisperPipelineForwards:
             return encoder_outputs
 
         if self.config.use_weighted_layer_sum:
-            hidden_states = torch.stack(encoder_outputs, dim=1)
+            hidden_states = encoder_outputs[_HIDDEN_STATES_START_POSITION]
+            hidden_states = torch.stack(hidden_states, dim=1)
             norm_weights = nn.functional.softmax(self.layer_weights, dim=-1)
             hidden_states = (hidden_states * norm_weights.view(-1, 1, 1)).sum(dim=1)
         else:

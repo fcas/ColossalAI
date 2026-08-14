@@ -1,4 +1,3 @@
-diffusers
 pytest
 coverage==7.2.3
 git+https://github.com/hpcaitech/pytest-testmon
@@ -10,7 +9,7 @@ torchx-nightly==2022.6.29 # torchrec 0.2.0 requires torchx-nightly. This package
 torchrec==0.2.0
 contexttimer
 einops
-triton==2.1.0
+triton
 requests==2.27.1 # downgrade to avoid huggingface error https://github.com/huggingface/transformers/issues/17611
 SentencePiece
 ninja
@@ -19,4 +18,3 @@ datasets
 pydantic
 ray
 peft>=0.7.1
-#auto-gptq now not support torch1.12

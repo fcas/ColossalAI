@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 
 from torch import Tensor
 
@@ -6,7 +6,7 @@ from .base_store import BaseStore
 
 
 class GradientStore(BaseStore):
-    def __init__(self, *args, partition_grad: bool = False, require_grad_sync: bool = True):
+    def __init__(self, *args, partition_grad: bool = False):
         super().__init__(*args)
         """
         self._grads_of_params mapping the parameter and its gradient slices
@@ -19,9 +19,6 @@ class GradientStore(BaseStore):
         """
         self._grads_of_params = dict()
         # stage 2
-        self._partition_grads = partition_grad
-        # grad accumulation
-        self.require_grad_sync = require_grad_sync
         self._working_index = 0 if partition_grad else self._local_rank
         # for zero2, it's `param_id: [grad_local_rank]`
         self.grad_to_param_mapping = dict()
@@ -93,7 +90,7 @@ class GradientStore(BaseStore):
 
         return grad_list
 
-    def get_working_grad_by_param_id(self, param_id) -> Tensor:
+    def get_working_grad_by_param_id(self, param_id) -> Optional[Tensor]:
         """
         Return the working gradient for the specified parameter.
 
@@ -107,16 +104,16 @@ class GradientStore(BaseStore):
         for group in self._grads_of_params.values():
             if param_id in group.keys():
                 return group[param_id][self._working_index]
-
-        raise KeyError(f"Working gradient for param_id {param_id} not found.")
+        return None
 
     def reset_grads_by_group_id(self, group_id: int):
         self._grads_of_params[group_id] = dict()
 
     def reset_all_gradients(self):
         self._grads_of_params = dict()
+        self.grad_to_param_mapping = dict()
 
-    def get_param_id_for_grad(self, grad: Tensor) -> int:
+    def get_param_id_for_grad(self, grad: Tensor) -> Optional[int]:
         """Return the id of a parameter which the gradient slice belongs to
 
         Args:
@@ -126,4 +123,4 @@ class GradientStore(BaseStore):
             int: the id of a parameter which the gradient slice belongs to
         """
 
-        return self.grad_to_param_mapping[id(grad)]
+        return self.grad_to_param_mapping.get(id(grad), None)

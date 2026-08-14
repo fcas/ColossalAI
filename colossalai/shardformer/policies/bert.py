@@ -11,7 +11,7 @@ import colossalai.shardformer.layer as col_nn
 from ..modeling.bert import (
     BertPipelineForwards,
     bert_sequence_parallel_forward_fn,
-    get_bert_flash_attention_forward,
+    get_bert_sequence_parallel_attention_forward,
     get_jit_fused_bert_intermediate_forward,
     get_jit_fused_bert_output_forward,
     get_jit_fused_bert_self_output_forward,
@@ -49,7 +49,7 @@ class BertPolicy(Policy):
             BertLayer,
             BertModel,
             BertOutput,
-            BertSelfAttention,
+            BertSdpaSelfAttention,
             BertSelfOutput,
         )
 
@@ -67,7 +67,7 @@ class BertPolicy(Policy):
         else:
             norm_cls = col_nn.LayerNorm
 
-        sp_mode = self.shard_config.sequence_parallelism_mode if self.shard_config.enable_sequence_parallelism else None
+        sp_mode = self.shard_config.sequence_parallelism_mode or None
         assert sp_mode != "all_to_all", "all_to_all sequence parallelism is not supported for Bert"
         if sp_mode == "ring":
             warnings.warn(
@@ -75,8 +75,19 @@ class BertPolicy(Policy):
             )
             sp_mode = "split_gather"
 
-        overlap = self.shard_config.enable_sequence_overlap
         sp_partial_derived = sp_mode == "split_gather"
+
+        use_zbv = self.pipeline_stage_manager is not None and self.pipeline_stage_manager.use_zbv
+
+        if self.shard_config.enable_sequence_parallelism:
+            # Fix the tgt_len size in bert sequence parallel attention forward.
+            self.append_or_create_method_replacement(
+                description={
+                    "forward": get_bert_sequence_parallel_attention_forward(self.shard_config),
+                },
+                policy=policy,
+                target_key=BertSdpaSelfAttention,
+            )
 
         if self.shard_config.enable_tensor_parallelism:
             assert (
@@ -99,7 +110,8 @@ class BertPolicy(Policy):
                         target_module=col_nn.Linear1D_Col,
                         kwargs={
                             "seq_parallel_mode": sp_mode,
-                            "overlap": overlap,
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
                         },
                     ),
                     SubModuleReplacementDescription(
@@ -107,7 +119,8 @@ class BertPolicy(Policy):
                         target_module=col_nn.Linear1D_Col,
                         kwargs={
                             "seq_parallel_mode": sp_mode,
-                            "overlap": overlap,
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
                         },
                     ),
                     SubModuleReplacementDescription(
@@ -115,7 +128,8 @@ class BertPolicy(Policy):
                         target_module=col_nn.Linear1D_Col,
                         kwargs={
                             "seq_parallel_mode": sp_mode,
-                            "overlap": overlap,
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
                         },
                     ),
                     SubModuleReplacementDescription(
@@ -125,7 +139,11 @@ class BertPolicy(Policy):
                     SubModuleReplacementDescription(
                         suffix="attention.output.dense",
                         target_module=col_nn.Linear1D_Row,
-                        kwargs={"seq_parallel_mode": sp_mode},
+                        kwargs={
+                            "seq_parallel_mode": sp_mode,
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
                     ),
                     SubModuleReplacementDescription(
                         suffix="attention.output.dropout",
@@ -136,14 +154,109 @@ class BertPolicy(Policy):
                         target_module=col_nn.Linear1D_Col,
                         kwargs={
                             "seq_parallel_mode": sp_mode,
-                            "overlap": overlap,
                             "skip_bias_add": self.enable_bias_gelu_fused,
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
                         },
                     ),
                     SubModuleReplacementDescription(
                         suffix="output.dense",
                         target_module=col_nn.Linear1D_Row,
-                        kwargs={"seq_parallel_mode": sp_mode},
+                        kwargs={
+                            "seq_parallel_mode": sp_mode,
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="output.dropout",
+                        target_module=col_nn.DropoutForParallelInput,
+                    ),
+                ],
+            )
+
+            policy[BertEmbeddings] = ModulePolicyDescription(
+                sub_module_replacement=[
+                    SubModuleReplacementDescription(
+                        suffix="dropout",
+                        target_module=col_nn.DropoutForReplicatedInput,
+                    ),
+                ]
+            )
+            if self.enable_bias_gelu_fused:
+                self.append_or_create_method_replacement(
+                    description={
+                        "forward": get_jit_fused_bert_intermediate_forward(),
+                    },
+                    policy=policy,
+                    target_key=BertIntermediate,
+                )
+
+        elif use_zbv:
+            policy[BertLayer] = ModulePolicyDescription(
+                sub_module_replacement=[
+                    SubModuleReplacementDescription(
+                        suffix="attention.self.query",
+                        target_module=col_nn.LinearWithGradAccum,
+                        kwargs={
+                            "seq_parallel_mode": sp_mode,
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="attention.self.key",
+                        target_module=col_nn.LinearWithGradAccum,
+                        kwargs={
+                            "seq_parallel_mode": sp_mode,
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="attention.self.value",
+                        target_module=col_nn.LinearWithGradAccum,
+                        kwargs={
+                            "seq_parallel_mode": sp_mode,
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="attention.self.dropout",
+                        target_module=col_nn.DropoutForParallelInput,
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="attention.output.dense",
+                        target_module=col_nn.LinearWithGradAccum,
+                        kwargs={
+                            "seq_parallel_mode": sp_mode,
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="attention.output.dropout",
+                        target_module=col_nn.DropoutForParallelInput,
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="intermediate.dense",
+                        target_module=col_nn.LinearWithGradAccum,
+                        kwargs={
+                            "seq_parallel_mode": sp_mode,
+                            "skip_bias_add": self.enable_bias_gelu_fused,
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
+                    ),
+                    SubModuleReplacementDescription(
+                        suffix="output.dense",
+                        target_module=col_nn.LinearWithGradAccum,
+                        kwargs={
+                            "seq_parallel_mode": sp_mode,
+                            "fp8_communication": self.shard_config.fp8_communication,
+                            "use_zbv": use_zbv,
+                        },
                     ),
                     SubModuleReplacementDescription(
                         suffix="output.dropout",
@@ -182,6 +295,13 @@ class BertPolicy(Policy):
                     SubModuleReplacementDescription(
                         suffix="word_embeddings",
                         target_module=embedding_cls,
+                        kwargs=(
+                            {
+                                "fp8_communication": self.shard_config.fp8_communication,
+                            }
+                            if self.shard_config.enable_tensor_parallelism
+                            else {}
+                        ),
                     )
                 ],
                 policy=policy,
@@ -218,16 +338,6 @@ class BertPolicy(Policy):
             target_key=BertEmbeddings,
         )
 
-        # use flash attention
-        if self.shard_config.enable_flash_attention:
-            self.append_or_create_method_replacement(
-                description={
-                    "forward": get_bert_flash_attention_forward(),
-                },
-                policy=policy,
-                target_key=BertSelfAttention,
-            )
-
         # use jit operator
         if self.shard_config.enable_jit_fused:
             self.append_or_create_method_replacement(
@@ -261,6 +371,7 @@ class BertPolicy(Policy):
                     kwargs={
                         "gather_output": True,
                         "make_vocab_size_divisible_by": self.shard_config.make_vocab_size_divisible_by,
+                        "fp8_communication": self.shard_config.fp8_communication,
                     },
                 ),
                 policy=base_policy,

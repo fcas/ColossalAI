@@ -1,12 +1,11 @@
-from typing import Dict, Optional
+from typing import Dict
 
 import torch
-import torch.distributed as dist
 from torch import Tensor
 from torch._utils import _flatten_dense_tensors
 from torch.distributed import ProcessGroup
 
-from colossalai.accelerator import get_accelerator
+from colossalai.accelerator.api import get_accelerator
 
 from .base_store import BaseStore
 
@@ -16,29 +15,11 @@ class BucketStore(BaseStore):
         self,
         torch_pg: ProcessGroup,
         reduce_bucket_size: int,
-        overlap_communication: bool,
-        communication_dtype: Optional[torch.dtype] = None,
-        moe_extra_dp_process_group: ProcessGroup = None,
     ):
         super().__init__(torch_pg)
         self.reduce_bucket_size = reduce_bucket_size
-        # communication params
-        self._overlap_communication = overlap_communication
-        self._communication_dtype = communication_dtype
-        if self._overlap_communication:
-            self.comm_stream = get_accelerator().Stream()
-        self.zero_local_rank = dist.get_rank(group=self.torch_pg)
-        self.zero_world_size = dist.get_world_size(group=self.torch_pg)
-        # extra dp
-        # This group is used to sync moe param, dp_world_size = moe_duplicates * extra_dp_size.
-        # Non moe param will be sync by global dp pg, moe param will be sync by extra dp pg.
-        # Moe param grad is be split as non moe param by global dp pg, and grad will be merged in step.
-        # And moe working and master param are split by extra dp pg.
-        self.moe_extra_dp_pg = moe_extra_dp_process_group
-        if self.moe_extra_dp_pg is not None:
-            self.moe_extra_dp_pg_size = dist.get_world_size(group=self.moe_extra_dp_pg)
-            self.moe_extra_dp_pg_rank = dist.get_rank(group=self.moe_extra_dp_pg)
         self.reset_all()
+        self.comm_stream = get_accelerator().Stream()
 
     def reset_all(self) -> None:
         # init
@@ -97,13 +78,13 @@ class BucketStore(BaseStore):
         }
         """
         for param, padding_size in zip(self._param_list, self._padding_size):
-            grad = param.grad.clone().detach().flatten()
+            grad = param.grad.detach().flatten()
             if padding_size > 0:
                 with torch.no_grad():
                     grad = torch.nn.functional.pad(grad.view(-1), [0, padding_size])
             grad_list = grad.split(grad.numel() // self._world_size)
             for rank in range(self._world_size):
-                grad_current_rank = grad_list[rank].clone().detach()
+                grad_current_rank = grad_list[rank].detach()
                 self.grad_to_param_mapping[id(grad_current_rank)] = id(param)
                 self._grad_in_bucket[rank].append(grad_current_rank)
             param.grad = None
@@ -129,7 +110,7 @@ class BucketStore(BaseStore):
 
         flat_grad = []
         for grad_list in self._grad_in_bucket.values():
-            flat_grad.append(_flatten_dense_tensors(grad_list))
+            flat_grad.extend(grad_list)
         flat_grad = _flatten_dense_tensors(flat_grad)
         return flat_grad
 
