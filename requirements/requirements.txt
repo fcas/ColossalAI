@@ -21,6 +21,6 @@ peft>=0.7.1,<=0.13.2
 bitsandbytes>=0.39.0
 rpyc==6.0.0
 fastapi
-uvicorn==0.29.0
+uvicorn==0.52.3
 galore_torch
 diffusers==0.29.0
