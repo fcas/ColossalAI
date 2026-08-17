@@ -18,7 +18,7 @@ google
 protobuf
 transformers==4.51.3
 peft>=0.7.1,<=0.13.2
-bitsandbytes>=0.39.0
+bitsandbytes>=0.50.1
 rpyc==6.0.0
 fastapi
 uvicorn==0.29.0
